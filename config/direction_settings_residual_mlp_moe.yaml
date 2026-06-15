@@ -1,0 +1,78 @@
+project:
+  name: direction_policy_m5_residual_mlp_moe
+
+paths:
+  model_dir: models/residual_mlp_moe
+  log_dir: logs/residual_mlp_moe
+
+model:
+  architecture: mixture_of_experts_direction_v1
+
+  sequence_length: 64
+  dropout: 0.04
+
+  # Residual-MLP-style experts
+  num_experts: 4
+  expert_hidden_size: 128
+  expert_layers: 3
+  expert_input_mode: last_mean_max
+
+  # Router decides which expert mixture to use
+  router_hidden_size: 48
+  router_inputs:
+    - sig_analytic_signal_class
+    - sig_buy_signal_count
+    - sig_sell_signal_count
+    - sig_net_signal_vote
+    - sig_signal_conflict
+    - sig_any_buy_signal
+    - sig_any_sell_signal
+    - sig_adx_strength
+    - sig_atr_zscore
+    - sig_rsi_centered
+    - sig_macd_hist_atr
+
+  dense_hidden_sizes:
+    - 128
+    - 64
+
+  use_edge_pips_head: false
+  edge_pips_scale: 12.0
+  use_analytic_signal_agreement_head: false
+
+training:
+  learning_rate: 0.0004
+  weight_decay: 0.0001
+  gradient_clip_norm: 1.0
+
+  gate_pos_weight: 0.35
+  gate_loss_weight: 1.0
+  side_direction_loss_weight: 1.0
+
+  use_analytic_signal_agreement_loss: false
+  analytic_signal_agreement_loss_weight: 0.0
+
+  curriculum_sampler:
+    enabled: true
+    schedule: linear
+    start_epoch: 1
+    end_epoch: 50
+    anchor_class: max_positive
+    start_ratios:
+      sell: 1.0
+      no_trade: 3.0
+      buy: 1.0
+    end_ratios:
+      sell: 1.0
+      no_trade: 8.0
+      buy: 1.0
+    with_replacement:
+      sell: true
+      no_trade: false
+      buy: true
+
+replay:
+  min_trades_for_score: 50
+  min_trade_probability: 0.60
+  min_direction_probability: 0.40
+  min_edge_pips: null
