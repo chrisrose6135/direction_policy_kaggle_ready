@@ -39,6 +39,9 @@ _LABEL_KEYS_TO_RECORD = [
     'positive_label_deduplication',
     'max_positive_setups_per_day',
     'discarded_positive_mode',
+    'method',
+    'label_method',
+    'strong_setup',
 ]
 
 
@@ -456,7 +459,11 @@ def _force_high_spread_rows_to_no_trade(
     # Existing convention in the current datasets: direction 0=sell, 1=no trade,
     # 2=buy; outcome 1=no clean winner, 2=winner.
     if 'direction_target' in out.columns:
-        out.loc[high_spread, 'direction_target'] = 1
+        # Event-based strong-setup datasets use -1 to mean IGNORE. Do not turn
+        # ignored high-spread rows into supervised NO_TRADE endpoints; only force
+        # rows that were already supervised labels.
+        direction_numeric = pd.to_numeric(out['direction_target'], errors='coerce').fillna(-1)
+        out.loc[high_spread & (direction_numeric >= 0), 'direction_target'] = 1
     if 'outcome_target' in out.columns:
         out.loc[high_spread, 'outcome_target'] = 1
 
@@ -611,6 +618,7 @@ def _prepare_symbol_dataset(
         'path': str(path),
         'label_generation': {
             'target_function': 'generate_direction_targets',
+            'label_method': (symbol_cfg.get('labels') or {}).get('method', (symbol_cfg.get('labels') or {}).get('label_method')),
             'labels_config': symbol_label_config,
             'spread_profile': spread_profile,
             'high_spread_no_trade_filter': high_spread_no_trade_filter,

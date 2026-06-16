@@ -375,6 +375,365 @@ def _candidate_strength(side_net: float, other_net: float, bars_to_outcome: int,
     return float(side_net + edge + 0.25 * speed_bonus)
 
 
+def _cfg_get_path(cfg: dict[str, Any], path: tuple[str, ...], default: Any = None) -> Any:
+    cur: Any = cfg
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur.get(key)
+    return cur
+
+
+def _cfg_float(value: Any, default: float | None = None) -> float | None:
+    if value in (None, ''):
+        return default
+    return float(value)
+
+
+def _cfg_int(value: Any, default: int | None = None) -> int | None:
+    if value in (None, ''):
+        return default
+    return int(value)
+
+
+def _cfg_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    return bool(value)
+
+
+def _strong_setup_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    lcfg = _label_cfg(cfg)
+    scfg = lcfg.get('strong_setup') or lcfg.get('strong_setup_labels') or {}
+    return scfg if isinstance(scfg, dict) else {}
+
+
+def _label_method(cfg: dict[str, Any]) -> str:
+    lcfg = _label_cfg(cfg)
+    method = lcfg.get('method', lcfg.get('label_method', lcfg.get('target_generation_mode', 'barrier_direction')))
+    return str(method or 'barrier_direction').strip().lower()
+
+
+def _is_strong_setup_method(cfg: dict[str, Any]) -> bool:
+    method = _label_method(cfg)
+    return method in {
+        'strong_setup_v1',
+        'clean_margin_v1',
+        'event_rank_v1',
+        'side_specific_event_rank_v1',
+    }
+
+
+def _side_cfg(scfg: dict[str, Any], side: str) -> dict[str, Any]:
+    side = side.lower()
+    pcfg = scfg.get('positive') or {}
+    if isinstance(pcfg, dict) and isinstance(pcfg.get(side), dict):
+        merged = dict(scfg.get('positive_defaults') or {})
+        merged.update(pcfg.get(side) or {})
+        return merged
+    return dict(scfg.get(side) or {})
+
+
+def _signal_count(out: pd.DataFrame, side: str) -> pd.Series:
+    side = side.lower()
+    col = f'sig_{side}_signal_count'
+    if col in out.columns:
+        return pd.to_numeric(out[col], errors='coerce').fillna(0.0)
+    cols = [c for c in out.columns if str(c).startswith('sig_') and str(c).endswith(f'_{side}')]
+    if not cols:
+        return pd.Series(0.0, index=out.index, dtype='float64')
+    return out[cols].apply(pd.to_numeric, errors='coerce').fillna(0.0).sum(axis=1)
+
+
+def _numeric_column_or_zero(out: pd.DataFrame, column: str) -> pd.Series:
+    if column in out.columns:
+        return pd.to_numeric(out[column], errors='coerce').fillna(0.0)
+    return pd.Series(0.0, index=out.index, dtype='float64')
+
+
+def _analytic_setup_score(out: pd.DataFrame, side: str) -> pd.Series:
+    """Causal analytic setup score used for label selection only.
+
+    The score is intentionally broad. It rewards same-side analytic votes and
+    trend/momentum alignment and penalises opposing votes/conflict. It is not a
+    future-derived value and may also be kept as a live feature via the existing
+    sig_* columns.
+    """
+    side = side.lower()
+    buy_count = _signal_count(out, 'buy')
+    sell_count = _signal_count(out, 'sell')
+    adx = _numeric_column_or_zero(out, 'sig_adx_strength')
+    trend1 = _numeric_column_or_zero(out, 'sig_ema_fast_minus_mid_atr')
+    trend2 = _numeric_column_or_zero(out, 'sig_ema_mid_minus_slow_atr')
+    slope1 = _numeric_column_or_zero(out, 'sig_ema_fast_slope_atr')
+    slope2 = _numeric_column_or_zero(out, 'sig_ema_mid_slope_atr')
+    macd = _numeric_column_or_zero(out, 'sig_macd_hist_atr')
+    macd_slope = _numeric_column_or_zero(out, 'sig_macd_hist_slope_atr')
+    rsi = _numeric_column_or_zero(out, 'sig_rsi_centered')
+    conflict = _numeric_column_or_zero(out, 'sig_signal_conflict')
+
+    if side == 'buy':
+        same = buy_count
+        opp = sell_count
+        directional = (
+            trend1.clip(lower=0) + trend2.clip(lower=0)
+            + 0.75 * slope1.clip(lower=0) + 0.5 * slope2.clip(lower=0)
+            + 0.75 * macd.clip(lower=0) + 0.5 * macd_slope.clip(lower=0)
+            + 0.25 * rsi.clip(lower=0)
+        )
+    else:
+        same = sell_count
+        opp = buy_count
+        directional = (
+            (-trend1).clip(lower=0) + (-trend2).clip(lower=0)
+            + 0.75 * (-slope1).clip(lower=0) + 0.5 * (-slope2).clip(lower=0)
+            + 0.75 * (-macd).clip(lower=0) + 0.5 * (-macd_slope).clip(lower=0)
+            + 0.25 * (-rsi).clip(lower=0)
+        )
+    score = 2.0 * same - 1.5 * opp + 2.0 * directional + 1.0 * adx.clip(lower=0) - 1.0 * conflict
+    return score.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def _mfe_mae_live_bidask(
+    symbol: str,
+    bid_entry: float,
+    bid_highs: np.ndarray,
+    bid_lows: np.ndarray,
+    spread_points: np.ndarray,
+    side: str,
+    cfg: dict[str, Any],
+    *,
+    entry_spread_points: float,
+) -> tuple[float, float]:
+    lcfg = _label_cfg(cfg)
+    slippage_pips = float(lcfg.get('slippage_pips', 0.0) or 0.0)
+    slippage_delta = price_delta_from_pips(symbol, slippage_pips, cfg)
+    side = side.upper()
+    if len(bid_highs) == 0 or len(bid_lows) == 0:
+        return np.nan, np.nan
+    future_spreads = np.asarray(spread_points, dtype=float)
+    if len(future_spreads) < len(bid_highs):
+        pad = np.full(len(bid_highs) - len(future_spreads), float(entry_spread_points), dtype=float)
+        future_spreads = np.concatenate([future_spreads, pad])
+    if side == 'BUY':
+        ask_entry = bid_entry + _spread_delta(symbol, entry_spread_points, cfg) + slippage_delta
+        mfe = pips_from_price_delta(symbol, float(np.nanmax(bid_highs)) - ask_entry, cfg)
+        mae = pips_from_price_delta(symbol, ask_entry - float(np.nanmin(bid_lows)), cfg)
+        return float(max(0.0, mfe)), float(max(0.0, mae))
+    sell_entry = bid_entry - slippage_delta
+    ask_highs = np.asarray(bid_highs, dtype=float) + np.array([_spread_delta(symbol, sp, cfg) for sp in future_spreads[:len(bid_highs)]])
+    ask_lows = np.asarray(bid_lows, dtype=float) + np.array([_spread_delta(symbol, sp, cfg) for sp in future_spreads[:len(bid_lows)]])
+    mfe = pips_from_price_delta(symbol, sell_entry - float(np.nanmin(ask_lows)), cfg)
+    mae = pips_from_price_delta(symbol, float(np.nanmax(ask_highs)) - sell_entry, cfg)
+    return float(max(0.0, mfe)), float(max(0.0, mae))
+
+
+def _mfe_mae_legacy(symbol: str, entry: float, highs: np.ndarray, lows: np.ndarray, side: str, cfg: dict[str, Any]) -> tuple[float, float]:
+    side = side.upper()
+    if len(highs) == 0 or len(lows) == 0:
+        return np.nan, np.nan
+    if side == 'BUY':
+        mfe = pips_from_price_delta(symbol, float(np.nanmax(highs)) - entry, cfg)
+        mae = pips_from_price_delta(symbol, entry - float(np.nanmin(lows)), cfg)
+    else:
+        mfe = pips_from_price_delta(symbol, entry - float(np.nanmin(lows)), cfg)
+        mae = pips_from_price_delta(symbol, float(np.nanmax(highs)) - entry, cfg)
+    return float(max(0.0, mfe)), float(max(0.0, mae))
+
+
+def _choose_random_indices(indices: np.ndarray, n: int, seed: int) -> list[int]:
+    if n <= 0 or len(indices) == 0:
+        return []
+    n = min(int(n), int(len(indices)))
+    rng = np.random.default_rng(int(seed))
+    return [int(x) for x in rng.choice(indices.astype(int), size=n, replace=False).tolist()]
+
+
+def _apply_strong_setup_labels(out: pd.DataFrame, cfg: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Convert raw TP/SL outcomes into side-specific strong setup labels.
+
+    This intentionally differs from every-bar 3-class labelling. It keeps clean,
+    high-margin BUY/SELL setup endpoints as positives and can keep only selected
+    hard/background negatives as NO_TRADE endpoints while marking the rest IGNORE.
+    """
+    scfg = _strong_setup_cfg(cfg)
+    if not _is_strong_setup_method(cfg):
+        return out, {'enabled': False, 'method': _label_method(cfg)}
+
+    result = out.copy()
+    n = len(result)
+    buy_cfg = _side_cfg(scfg, 'buy')
+    sell_cfg = _side_cfg(scfg, 'sell')
+    defaults = dict(scfg.get('positive_defaults') or {})
+
+    for col in (
+        'buy_candidate_mfe_pips', 'buy_candidate_mae_pips',
+        'sell_candidate_mfe_pips', 'sell_candidate_mae_pips',
+    ):
+        if col not in result.columns:
+            result[col] = np.nan
+
+    buy_net = pd.to_numeric(result.get('buy_candidate_net_pips'), errors='coerce')
+    sell_net = pd.to_numeric(result.get('sell_candidate_net_pips'), errors='coerce')
+    buy_outcome = pd.to_numeric(result.get('buy_candidate_outcome'), errors='coerce').fillna(-1).astype(int)
+    sell_outcome = pd.to_numeric(result.get('sell_candidate_outcome'), errors='coerce').fillna(-1).astype(int)
+    buy_mfe = pd.to_numeric(result.get('buy_candidate_mfe_pips'), errors='coerce')
+    sell_mfe = pd.to_numeric(result.get('sell_candidate_mfe_pips'), errors='coerce')
+    buy_mae = pd.to_numeric(result.get('buy_candidate_mae_pips'), errors='coerce')
+    sell_mae = pd.to_numeric(result.get('sell_candidate_mae_pips'), errors='coerce')
+
+    buy_score = _analytic_setup_score(result, 'buy')
+    sell_score = _analytic_setup_score(result, 'sell')
+    result['buy_analytic_setup_score'] = buy_score
+    result['sell_analytic_setup_score'] = sell_score
+
+    def _side_positive_mask(side: str, cfg_side: dict[str, Any]) -> pd.Series:
+        side = side.lower()
+        net = buy_net if side == 'buy' else sell_net
+        other_net = sell_net if side == 'buy' else buy_net
+        outcome = buy_outcome if side == 'buy' else sell_outcome
+        mfe = buy_mfe if side == 'buy' else sell_mfe
+        mae = buy_mae if side == 'buy' else sell_mae
+        score = buy_score if side == 'buy' else sell_score
+        min_net = _cfg_float(cfg_side.get('min_net_pips', defaults.get('min_net_pips')), _cfg_float(_label_cfg(cfg).get('min_clean_win_net_pips'), 0.0))
+        min_mfe = _cfg_float(cfg_side.get('min_mfe_pips', defaults.get('min_mfe_pips')), None)
+        max_mae = _cfg_float(cfg_side.get('max_mae_pips', defaults.get('max_mae_pips')), None)
+        min_edge = _cfg_float(cfg_side.get('min_side_edge_pips', defaults.get('min_side_edge_pips')), _cfg_float(_label_cfg(cfg).get('min_side_edge_pips'), 0.0))
+        min_score = _cfg_float(cfg_side.get('min_analytic_score', defaults.get('min_analytic_score')), None)
+        require_tp = _cfg_bool(cfg_side.get('require_tp_before_sl', defaults.get('require_tp_before_sl')), True)
+        allow_clean_without_analytic = _cfg_bool(cfg_side.get('allow_clean_without_analytic', defaults.get('allow_clean_without_analytic')), True)
+
+        mask = pd.Series(True, index=result.index)
+        if require_tp:
+            mask &= outcome == 2
+        if min_net is not None:
+            mask &= net >= float(min_net)
+        if min_mfe is not None:
+            mask &= mfe >= float(min_mfe)
+        if max_mae is not None:
+            mask &= mae <= float(max_mae)
+        if min_edge is not None:
+            mask &= (net - other_net) >= float(min_edge)
+        if min_score is not None:
+            analytic_ok = score >= float(min_score)
+            if allow_clean_without_analytic:
+                clean_ok = (outcome == 2) & (net >= float(min_net if min_net is not None else 0.0))
+                if min_mfe is not None:
+                    clean_ok &= mfe >= float(min_mfe)
+                if max_mae is not None:
+                    clean_ok &= mae <= float(max_mae)
+                mask &= analytic_ok | clean_ok
+            else:
+                mask &= analytic_ok
+        return mask.fillna(False)
+
+    buy_pos = _side_positive_mask('buy', buy_cfg)
+    sell_pos = _side_positive_mask('sell', sell_cfg)
+
+    # Resolve rare rows where both sides satisfy criteria.
+    buy_quality = (
+        buy_net.fillna(-1e9)
+        + (buy_net - sell_net).fillna(0.0).clip(lower=0)
+        + 0.25 * buy_mfe.fillna(0.0)
+        - 0.75 * buy_mae.fillna(0.0)
+        + 0.5 * buy_score.fillna(0.0)
+    )
+    sell_quality = (
+        sell_net.fillna(-1e9)
+        + (sell_net - buy_net).fillna(0.0).clip(lower=0)
+        + 0.25 * sell_mfe.fillna(0.0)
+        - 0.75 * sell_mae.fillna(0.0)
+        + 0.5 * sell_score.fillna(0.0)
+    )
+    both = buy_pos & sell_pos
+    buy_pos = buy_pos & (~both | (buy_quality >= sell_quality))
+    sell_pos = sell_pos & (~both | (sell_quality > buy_quality))
+
+    output_mode = str(scfg.get('output_mode', scfg.get('sequence_endpoint_mode', 'event_based')) or 'event_based').lower()
+    event_based = output_mode in {'event', 'events', 'event_based', 'event_rank', 'selected_endpoints'}
+    if event_based:
+        direction = np.full(n, -1, dtype=np.int64)
+    else:
+        direction = np.full(n, 1, dtype=np.int64)
+    direction[sell_pos.to_numpy(bool)] = 0
+    direction[buy_pos.to_numpy(bool)] = 2
+
+    positive_indices = np.flatnonzero((direction == 0) | (direction == 2))
+    hard_cfg = scfg.get('hard_negatives') or {}
+    bg_cfg = scfg.get('background_no_trade') or {}
+    selected_negatives: set[int] = set()
+    if event_based:
+        neg_mask = pd.Series(False, index=result.index)
+        if _cfg_bool(hard_cfg.get('enabled'), True):
+            buy_min = _cfg_float(hard_cfg.get('buy_analytic_score_min', hard_cfg.get('analytic_score_min')), 6.0)
+            sell_min = _cfg_float(hard_cfg.get('sell_analytic_score_min', hard_cfg.get('analytic_score_min')), 6.0)
+            buy_failed = (buy_score >= float(buy_min)) & ~buy_pos & ((buy_outcome != 2) | (buy_net <= 0) | (sell_net > buy_net))
+            sell_failed = (sell_score >= float(sell_min)) & ~sell_pos & ((sell_outcome != 2) | (sell_net <= 0) | (buy_net > sell_net))
+            neg_mask |= buy_failed.fillna(False) | sell_failed.fillna(False)
+            # Keep near-positive failures, because they are the most useful hard negatives.
+            near_mult = _cfg_float(hard_cfg.get('near_positive_mfe_fraction'), 0.75)
+            min_buy_mfe = _cfg_float(buy_cfg.get('min_mfe_pips', defaults.get('min_mfe_pips')), 10.0)
+            min_sell_mfe = _cfg_float(sell_cfg.get('min_mfe_pips', defaults.get('min_mfe_pips')), 10.0)
+            neg_mask |= (~buy_pos & (buy_mfe >= float(min_buy_mfe) * float(near_mult)) & (buy_net <= 0)).fillna(False)
+            neg_mask |= (~sell_pos & (sell_mfe >= float(min_sell_mfe) * float(near_mult)) & (sell_net <= 0)).fillna(False)
+        hard_idx = np.flatnonzero(neg_mask.to_numpy(bool) & (direction < 0))
+        hard_ratio = _cfg_float(hard_cfg.get('max_ratio_to_positive'), 2.0)
+        seed = int(_cfg_int(scfg.get('random_seed', _label_cfg(cfg).get('random_seed')), 43) or 43)
+        if hard_ratio is not None and len(positive_indices) > 0:
+            max_hard = int(round(float(hard_ratio) * len(positive_indices)))
+            hard_keep = _choose_random_indices(hard_idx, max_hard, seed + 1001)
+        else:
+            hard_keep = [int(x) for x in hard_idx.tolist()]
+        selected_negatives.update(hard_keep)
+
+        if _cfg_bool(bg_cfg.get('enabled'), True):
+            bg_ratio = _cfg_float(bg_cfg.get('ratio_to_positive'), 2.0)
+            n_bg = int(round(float(bg_ratio or 0.0) * max(1, len(positive_indices))))
+            all_no_trade = np.flatnonzero((direction < 0))
+            if selected_negatives:
+                all_no_trade = np.asarray([i for i in all_no_trade if int(i) not in selected_negatives], dtype=int)
+            bg_keep = _choose_random_indices(all_no_trade, n_bg, seed + 2002)
+            selected_negatives.update(bg_keep)
+        if selected_negatives:
+            direction[np.asarray(sorted(selected_negatives), dtype=int)] = 1
+
+    result['direction_target'] = direction.astype(np.int64)
+    result['buy_candidate_strength_score'] = buy_quality.replace([np.inf, -np.inf], np.nan).to_numpy(float)
+    result['sell_candidate_strength_score'] = sell_quality.replace([np.inf, -np.inf], np.nan).to_numpy(float)
+    result['candidate_strength_score'] = np.where(
+        result['direction_target'].to_numpy(int) == 2,
+        result['buy_candidate_strength_score'].to_numpy(float),
+        np.where(
+            result['direction_target'].to_numpy(int) == 0,
+            result['sell_candidate_strength_score'].to_numpy(float),
+            np.nan,
+        ),
+    )
+    result['label_filter_status'] = np.where(result['direction_target'] < 0, 'ignored_non_event', 'kept')
+    result.loc[result['direction_target'] == 1, 'label_filter_status'] = 'kept_negative'
+    result.loc[result['direction_target'] == 2, 'label_filter_status'] = 'kept_buy_positive'
+    result.loc[result['direction_target'] == 0, 'label_filter_status'] = 'kept_sell_positive'
+
+    info = {
+        'enabled': True,
+        'method': _label_method(cfg),
+        'output_mode': output_mode,
+        'buy_positive_rows': int((result['direction_target'] == 2).sum()),
+        'sell_positive_rows': int((result['direction_target'] == 0).sum()),
+        'hard_negative_rows': int(len(selected_negatives)),
+        'ignored_rows': int((result['direction_target'] < 0).sum()),
+        'both_side_positive_candidates': int(both.sum()),
+        'buy_rules': buy_cfg,
+        'sell_rules': sell_cfg,
+        'hard_negative_config': hard_cfg,
+        'background_no_trade_config': bg_cfg,
+    }
+    return result, info
+
 def _generate_barrier_direction_targets(df: pd.DataFrame, symbol: str, cfg: dict[str, Any]) -> pd.DataFrame:
     """Generate BUY/SELL/NO_TRADE direction targets.
 
@@ -429,6 +788,10 @@ def _generate_barrier_direction_targets(df: pd.DataFrame, symbol: str, cfg: dict
     sell_bars = np.full(n, 0, dtype=np.int64)
     buy_strength = np.full(n, np.nan, dtype=float)
     sell_strength = np.full(n, np.nan, dtype=float)
+    buy_mfe = np.full(n, np.nan, dtype=float)
+    buy_mae = np.full(n, np.nan, dtype=float)
+    sell_mfe = np.full(n, np.nan, dtype=float)
+    sell_mae = np.full(n, np.nan, dtype=float)
 
     last_i = max(0, n - horizon - 1)
     for i in range(last_i):
@@ -480,6 +843,14 @@ def _generate_barrier_direction_targets(df: pd.DataFrame, symbol: str, cfg: dict
             # again.
             bnet = float(buy.pips)
             snet = float(sell.pips)
+            bmfe, bmae = _mfe_mae_live_bidask(
+                symbol, entry_bid, future_hi, future_lo, future_spreads, 'BUY', cfg,
+                entry_spread_points=entry_spread_points,
+            )
+            smfe, smae = _mfe_mae_live_bidask(
+                symbol, entry_bid, future_hi, future_lo, future_spreads, 'SELL', cfg,
+                entry_spread_points=entry_spread_points,
+            )
         else:
             entry = closes[i]
             if not np.isfinite(entry):
@@ -494,6 +865,8 @@ def _generate_barrier_direction_targets(df: pd.DataFrame, symbol: str, cfg: dict
             cost = _spread_cost_pips(spreads[i], cfg)
             bnet = float(buy.pips - cost)
             snet = float(sell.pips - cost)
+            bmfe, bmae = _mfe_mae_legacy(symbol, entry, future_hi, future_lo, 'BUY', cfg)
+            smfe, smae = _mfe_mae_legacy(symbol, entry, future_hi, future_lo, 'SELL', cfg)
 
         buy_net[i] = bnet
         sell_net[i] = snet
@@ -501,6 +874,10 @@ def _generate_barrier_direction_targets(df: pd.DataFrame, symbol: str, cfg: dict
         sell_outcome[i] = int(sell.outcome)
         buy_bars[i] = int(buy.bars_to_outcome)
         sell_bars[i] = int(sell.bars_to_outcome)
+        buy_mfe[i] = float(bmfe)
+        buy_mae[i] = float(bmae)
+        sell_mfe[i] = float(smfe)
+        sell_mae[i] = float(smae)
 
         buy_is_clean_win = buy.outcome == 2 and bnet >= min_clean_win_net_pips
         sell_is_clean_win = sell.outcome == 2 and snet >= min_clean_win_net_pips
@@ -529,6 +906,10 @@ def _generate_barrier_direction_targets(df: pd.DataFrame, symbol: str, cfg: dict
     out['sell_candidate_outcome'] = sell_outcome[:keep]
     out['buy_candidate_bars_to_outcome'] = buy_bars[:keep]
     out['sell_candidate_bars_to_outcome'] = sell_bars[:keep]
+    out['buy_candidate_mfe_pips'] = buy_mfe[:keep]
+    out['buy_candidate_mae_pips'] = buy_mae[:keep]
+    out['sell_candidate_mfe_pips'] = sell_mfe[:keep]
+    out['sell_candidate_mae_pips'] = sell_mae[:keep]
     out['buy_candidate_strength_score'] = buy_strength[:keep]
     out['sell_candidate_strength_score'] = sell_strength[:keep]
     out['candidate_strength_score'] = np.where(
@@ -542,9 +923,11 @@ def _generate_barrier_direction_targets(df: pd.DataFrame, symbol: str, cfg: dict
     )
     out['label_filter_status'] = 'kept'
 
+    out, strong_setup_info = _apply_strong_setup_labels(out, cfg)
     out, dedup_info = _apply_positive_deduplication(out, cfg)
     out, daily_cap_info = _apply_daily_positive_cap(out, cfg)
     positive_filter_info = {
+        'strong_setup': strong_setup_info,
         'deduplication': dedup_info,
         'daily_cap': daily_cap_info,
         'ignored_rows_after_filters': int((pd.to_numeric(out['direction_target'], errors='coerce') < 0).sum()),

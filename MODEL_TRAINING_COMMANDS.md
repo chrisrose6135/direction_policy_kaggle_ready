@@ -275,3 +275,33 @@ python -m src.live_direction_policy ^
   --data-source mt5 ^
   --poll-seconds 20
 ```
+
+---
+
+## Strong-setup labelling mode
+
+This package now includes `labels.method: strong_setup_v1`. It creates an event-based direction dataset rather than supervising every candle. Non-event rows are written with `direction_target = -1` and are ignored as sequence endpoints while still being available as historical context.
+
+Recommended preparation command:
+
+```bash
+python -m src.prepare_direction_dataset \
+  --config config/direction_settings_residual_mlp.yaml \
+  --symbols EURUSD \
+  --workers 2 \
+  --date-start 2021-01-01 \
+  --date-end 2025-09-01 \
+  --out-dir data/direction
+```
+
+Then train the model architectures using the pregenerated strong-setup CSVs:
+
+```bash
+python -m src.train_all_direction_models \
+  --symbols EURUSD \
+  --epochs 50 \
+  --batch-size 512 \
+  --device cpu
+```
+
+See `STRONG_SETUP_LABELS.md` for the label rules and tuning parameters.

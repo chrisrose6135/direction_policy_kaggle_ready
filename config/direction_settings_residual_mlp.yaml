@@ -290,6 +290,40 @@ labels:
     sell: 100
     rank_by: candidate_strength_score
     discarded_positive_mode: ignore
+  method: strong_setup_v1
+  strong_setup:
+    output_mode: event_based
+    random_seed: 43
+    positive_defaults:
+      require_tp_before_sl: true
+      min_net_pips: 3.0
+      min_mfe_pips: 10.0
+      max_mae_pips: 4.0
+      min_side_edge_pips: 2.0
+      allow_clean_without_analytic: true
+    positive:
+      buy:
+        min_net_pips: 3.0
+        min_mfe_pips: 10.0
+        max_mae_pips: 4.0
+        min_side_edge_pips: 2.0
+        min_analytic_score: null
+        allow_clean_without_analytic: true
+      sell:
+        min_net_pips: 3.0
+        min_mfe_pips: 10.0
+        max_mae_pips: 4.0
+        min_side_edge_pips: 1.5
+        min_analytic_score: null
+        allow_clean_without_analytic: true
+    hard_negatives:
+      enabled: true
+      analytic_score_min: 4.0
+      near_positive_mfe_fraction: 0.75
+      max_ratio_to_positive: 2.0
+    background_no_trade:
+      enabled: true
+      ratio_to_positive: 2.0
 model:
   architecture: residual_mlp_gate_direction_v1
   sequence_length: 64

@@ -7,6 +7,62 @@ import sys
 from pathlib import Path
 
 
+def _list_dir_brief(path: Path, max_items: int = 80) -> None:
+    try:
+        if not path.exists():
+            print(f'[path check] {path} does not exist', flush=True)
+            return
+        print(f'[path check] Listing {path}:', flush=True)
+        count = 0
+        for child in sorted(path.rglob('*')):
+            if count >= max_items:
+                print(f'  ... truncated after {max_items} entries', flush=True)
+                break
+            try:
+                rel = child.relative_to(path)
+            except Exception:
+                rel = child
+            suffix = '/' if child.is_dir() else ''
+            print(f'  {rel}{suffix}', flush=True)
+            count += 1
+    except Exception as exc:
+        print(f'[path check] Could not list {path}: {exc}', flush=True)
+
+
+def _normalise_path_token(text: str) -> str:
+    import re
+    return re.sub(r'[^a-z0-9]+', '', str(text).lower())
+
+
+def _resolve_kaggle_input_path(raw_path: str | None) -> str | None:
+    if raw_path is None:
+        return None
+    path = Path(raw_path)
+    if path.exists():
+        return str(path)
+    # Kaggle input slugs are usually lower-case / hyphenated. Try to repair
+    # common paths such as /kaggle/input/MT5_Dataset/raw -> /kaggle/input/mt5-dataset/raw.
+    if str(path).startswith('/kaggle/input'):
+        root = Path('/kaggle/input')
+        if root.exists():
+            parts = path.parts
+            wanted_dataset = parts[3] if len(parts) > 3 else None
+            tail = Path(*parts[4:]) if len(parts) > 4 else Path()
+            if wanted_dataset:
+                wanted_norm = _normalise_path_token(wanted_dataset)
+                for ds in root.iterdir():
+                    if ds.is_dir() and _normalise_path_token(ds.name) == wanted_norm:
+                        candidate = ds / tail
+                        if candidate.exists():
+                            print(f'[path check] Resolved raw input path: {path} -> {candidate}', flush=True)
+                            return str(candidate)
+                        # If /raw was supplied but absent, fall back to dataset root.
+                        if tail.name.lower() == 'raw':
+                            print(f'[path check] {candidate} not found; using dataset root {ds}', flush=True)
+                            return str(ds)
+    return str(path)
+
+
 DEFAULT_CONFIGS = [
     'config/direction_settings_residual_mlp.yaml',
     'config/direction_settings_tcn.yaml',
@@ -20,7 +76,17 @@ def run(cmd: list[str], *, dry_run: bool = False) -> None:
     print('\n$ ' + ' '.join(map(str, cmd)), flush=True)
     if dry_run:
         return
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.stdout:
+        print(result.stdout, end='', flush=True)
+    if result.stderr:
+        print(result.stderr, end='', file=sys.stderr, flush=True)
+    if result.returncode != 0:
+        cmd_str = ' '.join(map(str, cmd))
+        raise SystemExit(
+            f'Command failed with exit code {result.returncode}: {cmd_str}\n'
+            'Scroll up for the command output printed immediately above this message.'
+        )
 
 
 def add_optional(cmd: list[str], flag: str, value) -> None:
@@ -57,6 +123,14 @@ def main() -> None:
     p.add_argument('--skip-direction-prep', action='store_true')
     p.add_argument('--dry-run', action='store_true')
     args = p.parse_args()
+    args.raw_input_dir = _resolve_kaggle_input_path(args.raw_input_dir)
+    if args.raw_input_dir is not None:
+        raw_path = Path(args.raw_input_dir)
+        if not raw_path.exists():
+            print(f'[path check] raw input directory not found: {raw_path}', flush=True)
+            _list_dir_brief(Path('/kaggle/input'))
+            raise SystemExit('Raw input directory does not exist. Use the exact lower-case Kaggle dataset path, or set --raw-input-dir to the dataset root.')
+        _list_dir_brief(raw_path, max_items=30)
 
     os.environ.setdefault('OMP_NUM_THREADS', '1')
     os.environ.setdefault('MKL_NUM_THREADS', '1')
@@ -80,6 +154,10 @@ def main() -> None:
         if args.force_raw:
             cmd.append('--force')
         run(cmd, dry_run=args.dry_run)
+        if not args.dry_run:
+            missing_raw = [sym for sym in symbols if not Path('data/raw', f'{sym}_{args.timeframe.upper()}.csv').exists()]
+            if missing_raw:
+                raise SystemExit(f'Raw copy/prep did not produce expected files for: {missing_raw}. Check CSV names and symbol list.')
 
     if not args.skip_feature_prep:
         cmd = [
@@ -107,6 +185,22 @@ def main() -> None:
         add_optional(cmd, '--date-end', args.replay_end or args.train_end)
         add_optional(cmd, '--max-rows', args.direction_max_rows)
         run(cmd, dry_run=args.dry_run)
+        if not args.dry_run:
+            for sym in symbols:
+                direction_path = Path('data/direction', f'{sym}_{args.timeframe.upper()}_direction_training.csv')
+                if not direction_path.exists():
+                    raise SystemExit(f'Direction dataset was not created: {direction_path}')
+                try:
+                    line_count = sum(1 for _ in direction_path.open('r', encoding='utf-8', errors='ignore'))
+                except Exception:
+                    line_count = -1
+                if line_count <= 1:
+                    raise SystemExit(
+                        f'Direction dataset is empty or header-only: {direction_path}. '
+                        'This usually means the requested --train-start/--replay-end date range does not overlap the raw CSV, '
+                        'or the raw time column was not parsed correctly. Check the printed row/date filter output above.'
+                    )
+                print(f'[check] {direction_path}: {line_count-1:,} data rows', flush=True)
 
     if args.mode == 'prepare-only':
         print('\nPreparation complete. Direction CSVs should now be in data/direction/.')

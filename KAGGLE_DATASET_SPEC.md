@@ -50,3 +50,15 @@ The helper can map common aliases such as `DateTime`, `timestamp`, `Open`, `High
 ## Timeframe
 
 The current project configs expect M5. If the raw data is not M5, generate or resample to M5 before training.
+
+## Strong-setup direction labels
+
+The prepared direction CSV now supports event-based rows via `direction_target = -1` for ignored non-event endpoints. Training code already skips these rows as supervised sequence endpoints while keeping them available as context.
+
+Required target columns remain:
+
+- `direction_target`: `0=SELL`, `1=NO_TRADE`, `2=BUY`, `-1=IGNORE`
+- `buy_edge_pips_target`
+- `sell_edge_pips_target`
+
+The label-generation metadata JSON records `label_generation.positive_label_filters.strong_setup` with the positive/hard-negative counts used for each symbol.
