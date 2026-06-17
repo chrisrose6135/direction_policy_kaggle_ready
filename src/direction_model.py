@@ -545,6 +545,25 @@ class DirectionTradePolicyNet(nn.Module):
         self.representation_size = int(self.encoder.output_size)
         self.trade_gate_head = nn.Linear(self.representation_size, 1)
         self.side_direction_head = nn.Linear(self.representation_size, 2)  # SELL, BUY conditional on trade
+        target_mode = str((cfg.get('training') or {}).get('target_mode', mcfg.get('target_mode', 'direction')) or 'direction').strip().lower()
+        label_method = str(lcfg.get('method', lcfg.get('label_method', '')) or '').strip().lower()
+        strong_cfg = lcfg.get('strong_setup', {}) or {}
+        strong_output_mode = str(strong_cfg.get('output_mode', '') or '').strip().lower() if isinstance(strong_cfg, dict) else ''
+        label_requests_setup_heads = (
+            label_method in {'strong_setup_v1', 'side_setup_v1', 'side_setup_ranking'}
+            or strong_output_mode in {'event_based', 'side_setup', 'side_setup_ranking', 'setup_ranking'}
+        )
+        self.use_side_setup_heads = _as_bool(
+            mcfg.get('use_side_setup_heads'),
+            target_mode in {'side_setup', 'side_setup_ranking', 'setup_ranking'} or label_requests_setup_heads,
+        )
+        self.decision_output_mode = str(mcfg.get('decision_output_mode', 'side_setup' if self.use_side_setup_heads else 'gate_direction') or '').strip().lower()
+        self.side_setup_head = nn.Linear(self.representation_size, 2) if self.use_side_setup_heads else None  # BUY, SELL independent logits
+        self.use_setup_quality_head = _as_bool(mcfg.get('use_setup_quality_head'), self.use_side_setup_heads)
+        self.setup_quality_scale = float(mcfg.get('setup_quality_scale', mcfg.get('edge_pips_scale', 12.0)) or 12.0)
+        if self.setup_quality_scale <= 0:
+            self.setup_quality_scale = 12.0
+        self.setup_quality_head = nn.Linear(self.representation_size, 2) if self.use_setup_quality_head else None  # BUY, SELL quality/edge scores
         self.use_edge_pips_head = _as_bool(mcfg.get('use_edge_pips_head'), True)
         self.edge_pips_scale = float(mcfg.get('edge_pips_scale', lcfg.get('take_profit_pips', 10.0)) or 10.0)
         if self.edge_pips_scale <= 0:
@@ -567,6 +586,8 @@ class DirectionTradePolicyNet(nn.Module):
                 'combined_direction': DIRECTION_CLASS_NAMES,
                 'edge_pips': {0: 'buy_edge_pips', 1: 'sell_edge_pips'} if self.use_edge_pips_head else None,
                 'analytic_signal_agreement': DIRECTION_CLASS_NAMES if self.use_analytic_signal_agreement_head else None,
+                'side_setup': {0: 'BUY_SETUP', 1: 'SELL_SETUP'} if self.use_side_setup_heads else None,
+                'setup_quality': {0: 'buy_setup_quality', 1: 'sell_setup_quality'} if self.use_setup_quality_head else None,
             },
             **encoder_details,
             'dropout': float(dropout),
@@ -575,6 +596,10 @@ class DirectionTradePolicyNet(nn.Module):
             'use_edge_pips_head': bool(self.use_edge_pips_head),
             'edge_pips_scale': float(self.edge_pips_scale),
             'use_analytic_signal_agreement_head': bool(self.use_analytic_signal_agreement_head),
+            'use_side_setup_heads': bool(self.use_side_setup_heads),
+            'decision_output_mode': str(self.decision_output_mode),
+            'use_setup_quality_head': bool(self.use_setup_quality_head),
+            'setup_quality_scale': float(self.setup_quality_scale),
         }
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -612,6 +637,43 @@ class DirectionTradePolicyNet(nn.Module):
             out['edge_pips'] = edge_pips
             out['buy_edge_pips'] = edge_pips[:, 0]
             out['sell_edge_pips'] = edge_pips[:, 1]
+        if self.side_setup_head is not None:
+            setup_logits = self.side_setup_head(rep)
+            setup_probs = torch.sigmoid(setup_logits)
+            buy_setup_prob = setup_probs[:, 0]
+            sell_setup_prob = setup_probs[:, 1]
+            setup_trade_prob = torch.maximum(buy_setup_prob, sell_setup_prob)
+            setup_side_sum = torch.clamp(buy_setup_prob + sell_setup_prob, min=1e-7)
+            setup_sell_given_trade = sell_setup_prob / setup_side_sum
+            setup_buy_given_trade = buy_setup_prob / setup_side_sum
+            setup_sell_prob = setup_trade_prob * setup_sell_given_trade
+            setup_buy_prob = setup_trade_prob * setup_buy_given_trade
+            setup_no_trade_prob = torch.clamp(1.0 - setup_trade_prob, min=0.0, max=1.0)
+            setup_combined = torch.stack([setup_sell_prob, setup_no_trade_prob, setup_buy_prob], dim=1)
+            setup_combined = setup_combined / torch.clamp(setup_combined.sum(dim=1, keepdim=True), min=1e-7)
+            out['buy_setup_logit'] = setup_logits[:, 0]
+            out['sell_setup_logit'] = setup_logits[:, 1]
+            out['buy_setup_probability'] = buy_setup_prob
+            out['sell_setup_probability'] = sell_setup_prob
+            out['setup_trade_probability'] = setup_trade_prob
+            out['setup_direction_probabilities'] = setup_combined
+            if self.decision_output_mode in {'side_setup', 'setup', 'side_setup_ranking', 'setup_ranking'}:
+                out['gate_direction_probabilities'] = out['direction_probabilities']
+                out['direction_probabilities'] = setup_combined
+                out['direction_logits'] = torch.log(torch.clamp(setup_combined, min=1e-7, max=1.0))
+                out['trade_probability'] = setup_trade_prob
+                out['no_trade_probability'] = setup_no_trade_prob
+                out['side_sell_probability'] = setup_sell_given_trade
+                out['side_buy_probability'] = setup_buy_given_trade
+                out['sell_probability'] = setup_sell_prob
+                out['buy_probability'] = setup_buy_prob
+        if self.setup_quality_head is not None:
+            setup_quality_norm = self.setup_quality_head(rep)
+            setup_quality = setup_quality_norm * float(self.setup_quality_scale)
+            out['setup_quality_normalized'] = setup_quality_norm
+            out['setup_quality'] = setup_quality
+            out['buy_setup_quality_score'] = setup_quality[:, 0]
+            out['sell_setup_quality_score'] = setup_quality[:, 1]
         if self.analytic_signal_agreement_head is not None:
             out['analytic_signal_logits'] = self.analytic_signal_agreement_head(rep)
         return out

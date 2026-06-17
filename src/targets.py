@@ -218,6 +218,16 @@ def _discard_positive_rows(out: pd.DataFrame, indices: list[int], *, mode: str, 
     else:
         replacement = 1
     out.loc[indices, 'direction_target'] = int(replacement)
+    # Keep side-specific setup targets consistent with positive deduplication /
+    # daily caps. Rows discarded as IGNORE should not continue to train the BUY
+    # or SELL setup heads as positives. Rows converted to NO_TRADE become
+    # negatives for whichever side they were previously positive for.
+    for side_col in ('buy_setup_target', 'sell_setup_target'):
+        if side_col in out.columns:
+            current = pd.to_numeric(out.loc[indices, side_col], errors='coerce').fillna(-1).astype(int)
+            pos_idx = list(current[current == 1].index)
+            if pos_idx:
+                out.loc[pos_idx, side_col] = int(replacement if replacement < 0 else 0)
     if 'label_filter_status' in out.columns:
         out.loc[indices, 'label_filter_status'] = reason
     return int(len(indices))
@@ -665,6 +675,11 @@ def _apply_strong_setup_labels(out: pd.DataFrame, cfg: dict[str, Any]) -> tuple[
     positive_indices = np.flatnonzero((direction == 0) | (direction == 2))
     hard_cfg = scfg.get('hard_negatives') or {}
     bg_cfg = scfg.get('background_no_trade') or {}
+    # Side-specific failed setup masks are used both for selecting hard negatives
+    # and for the new side-specific setup heads. Initialise them here so the
+    # non-event mode still has well-defined targets.
+    buy_failed = pd.Series(False, index=result.index)
+    sell_failed = pd.Series(False, index=result.index)
     selected_negatives: set[int] = set()
     if event_based:
         neg_mask = pd.Series(False, index=result.index)
@@ -702,6 +717,45 @@ def _apply_strong_setup_labels(out: pd.DataFrame, cfg: dict[str, Any]) -> tuple[
             direction[np.asarray(sorted(selected_negatives), dtype=int)] = 1
 
     result['direction_target'] = direction.astype(np.int64)
+
+    # Side-specific setup targets for the new training mode:
+    #   buy_setup_target/sell_setup_target: 1=clean setup, 0=side-specific failed/background negative, -1=ignore.
+    # These solve the over-conservative 3-class gate problem by letting BUY and
+    # SELL be learned as two independent setup-quality ranking problems.
+    buy_setup_target = np.full(n, -1, dtype=np.int64) if event_based else np.zeros(n, dtype=np.int64)
+    sell_setup_target = np.full(n, -1, dtype=np.int64) if event_based else np.zeros(n, dtype=np.int64)
+    buy_setup_target[buy_pos.to_numpy(bool)] = 1
+    sell_setup_target[buy_pos.to_numpy(bool)] = 0
+    sell_setup_target[sell_pos.to_numpy(bool)] = 1
+    buy_setup_target[sell_pos.to_numpy(bool)] = 0
+    if event_based and selected_negatives:
+        neg_idx = np.asarray(sorted(selected_negatives), dtype=int)
+        buy_failed_arr = buy_failed.to_numpy(bool)
+        sell_failed_arr = sell_failed.to_numpy(bool)
+        buy_setup_target[neg_idx[buy_failed_arr[neg_idx]]] = 0
+        sell_setup_target[neg_idx[sell_failed_arr[neg_idx]]] = 0
+        background_idx = neg_idx[~(buy_failed_arr[neg_idx] | sell_failed_arr[neg_idx])]
+        if len(background_idx):
+            buy_setup_target[background_idx] = 0
+            sell_setup_target[background_idx] = 0
+    elif not event_based:
+        # In every-bar mode all non-positive rows are negatives for both side heads.
+        buy_setup_target[~buy_pos.to_numpy(bool)] = 0
+        sell_setup_target[~sell_pos.to_numpy(bool)] = 0
+
+    result['buy_setup_target'] = buy_setup_target.astype(np.int64)
+    result['sell_setup_target'] = sell_setup_target.astype(np.int64)
+    quality_clip = _cfg_float(scfg.get('quality_clip_pips', scfg.get('quality_clip')), 48.0)
+    buy_quality_values = buy_quality.replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(float)
+    sell_quality_values = sell_quality.replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(float)
+    if quality_clip is not None and float(quality_clip) > 0:
+        buy_quality_values = np.clip(buy_quality_values, -float(quality_clip), float(quality_clip))
+        sell_quality_values = np.clip(sell_quality_values, -float(quality_clip), float(quality_clip))
+    result['buy_setup_quality_score_target'] = buy_quality_values
+    result['sell_setup_quality_score_target'] = sell_quality_values
+    result['buy_setup_analytic_score'] = buy_score.replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(float)
+    result['sell_setup_analytic_score'] = sell_score.replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(float)
+
     result['buy_candidate_strength_score'] = buy_quality.replace([np.inf, -np.inf], np.nan).to_numpy(float)
     result['sell_candidate_strength_score'] = sell_quality.replace([np.inf, -np.inf], np.nan).to_numpy(float)
     result['candidate_strength_score'] = np.where(
@@ -725,6 +779,12 @@ def _apply_strong_setup_labels(out: pd.DataFrame, cfg: dict[str, Any]) -> tuple[
         'buy_positive_rows': int((result['direction_target'] == 2).sum()),
         'sell_positive_rows': int((result['direction_target'] == 0).sum()),
         'hard_negative_rows': int(len(selected_negatives)),
+        'buy_setup_positive_rows': int((result['buy_setup_target'] == 1).sum()),
+        'buy_setup_negative_rows': int((result['buy_setup_target'] == 0).sum()),
+        'buy_setup_ignored_rows': int((result['buy_setup_target'] < 0).sum()),
+        'sell_setup_positive_rows': int((result['sell_setup_target'] == 1).sum()),
+        'sell_setup_negative_rows': int((result['sell_setup_target'] == 0).sum()),
+        'sell_setup_ignored_rows': int((result['sell_setup_target'] < 0).sum()),
         'ignored_rows': int((result['direction_target'] < 0).sum()),
         'both_side_positive_candidates': int(both.sum()),
         'buy_rules': buy_cfg,

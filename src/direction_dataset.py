@@ -24,6 +24,12 @@ class DirectionPreparedArrays:
     sell_edge_pips: np.ndarray | None = None
     has_edge_targets: np.ndarray | None = None
     analytic_signal_class: np.ndarray | None = None
+    buy_setup_target: np.ndarray | None = None
+    sell_setup_target: np.ndarray | None = None
+    has_buy_setup_target: np.ndarray | None = None
+    has_sell_setup_target: np.ndarray | None = None
+    buy_setup_quality_score: np.ndarray | None = None
+    sell_setup_quality_score: np.ndarray | None = None
 
 
 def _require_direction_target(df: pd.DataFrame) -> None:
@@ -79,6 +85,28 @@ def prepare_direction_arrays(
     # labelled sequence endpoints.
     raw_y = pd.to_numeric(df['direction_target'], errors='coerce').fillna(-1).astype(int).to_numpy(np.int64)
 
+    # Optional side-specific setup labels for event/ranking training. Fallback to
+    # direction_target so older pregenerated CSVs remain usable.
+    if 'buy_setup_target' in df.columns:
+        buy_setup_raw = pd.to_numeric(df['buy_setup_target'], errors='coerce').fillna(-1).astype(int).to_numpy(np.int64)
+    else:
+        buy_setup_raw = np.where(raw_y >= 0, np.where(raw_y == 2, 1, 0), -1).astype(np.int64)
+    if 'sell_setup_target' in df.columns:
+        sell_setup_raw = pd.to_numeric(df['sell_setup_target'], errors='coerce').fillna(-1).astype(int).to_numpy(np.int64)
+    else:
+        sell_setup_raw = np.where(raw_y >= 0, np.where(raw_y == 0, 1, 0), -1).astype(np.int64)
+
+    buy_quality_col = 'buy_setup_quality_score_target' if 'buy_setup_quality_score_target' in df.columns else None
+    sell_quality_col = 'sell_setup_quality_score_target' if 'sell_setup_quality_score_target' in df.columns else None
+    if buy_quality_col:
+        buy_quality_raw = pd.to_numeric(df[buy_quality_col], errors='coerce').fillna(0.0).to_numpy(np.float32)
+    else:
+        buy_quality_raw = np.zeros(len(df), dtype=np.float32)
+    if sell_quality_col:
+        sell_quality_raw = pd.to_numeric(df[sell_quality_col], errors='coerce').fillna(0.0).to_numpy(np.float32)
+    else:
+        sell_quality_raw = np.zeros(len(df), dtype=np.float32)
+
     # Optional future-derived regression targets for the hierarchical edge/pips
     # head. These columns are never used as input features because the feature
     # selector rejects *_target columns. If older pregenerated datasets do not
@@ -114,10 +142,22 @@ def prepare_direction_arrays(
     sell_edges: list[float] = []
     edge_masks: list[bool] = []
     analytic_signal_classes: list[int] = []
+    buy_setup_targets: list[int] = []
+    sell_setup_targets: list[int] = []
+    has_buy_setup_targets: list[bool] = []
+    has_sell_setup_targets: list[bool] = []
+    buy_setup_quality_scores: list[float] = []
+    sell_setup_quality_scores: list[float] = []
     for end in range(seq_len - 1, len(df)):
         label = int(raw_y[end])
-        if label not in (0, 1, 2):
+        buy_setup_label = int(buy_setup_raw[end])
+        sell_setup_label = int(sell_setup_raw[end])
+        if label not in (0, 1, 2) and buy_setup_label not in (0, 1) and sell_setup_label not in (0, 1):
             continue
+        if label not in (0, 1, 2):
+            # Side-setup rows can still be valid even when the legacy 3-class
+            # label is ignored. Use NO_TRADE only for legacy metrics.
+            label = 1
         be = float(buy_edge_raw[end])
         se = float(sell_edge_raw[end])
         has_edge = bool(np.isfinite(be) and np.isfinite(se))
@@ -128,6 +168,12 @@ def prepare_direction_arrays(
         sell_edges.append(se if has_edge else 0.0)
         edge_masks.append(has_edge)
         analytic_signal_classes.append(int(analytic_signal_raw[end]))
+        buy_setup_targets.append(buy_setup_label if buy_setup_label in (0, 1) else 0)
+        sell_setup_targets.append(sell_setup_label if sell_setup_label in (0, 1) else 0)
+        has_buy_setup_targets.append(buy_setup_label in (0, 1))
+        has_sell_setup_targets.append(sell_setup_label in (0, 1))
+        buy_setup_quality_scores.append(float(buy_quality_raw[end]))
+        sell_setup_quality_scores.append(float(sell_quality_raw[end]))
 
     return DirectionPreparedArrays(
         X_seq=np.asarray(xs, dtype=np.float32),
@@ -139,6 +185,12 @@ def prepare_direction_arrays(
         sell_edge_pips=np.asarray(sell_edges, dtype=np.float32),
         has_edge_targets=np.asarray(edge_masks, dtype=bool),
         analytic_signal_class=np.asarray(analytic_signal_classes, dtype=np.int64),
+        buy_setup_target=np.asarray(buy_setup_targets, dtype=np.int64),
+        sell_setup_target=np.asarray(sell_setup_targets, dtype=np.int64),
+        has_buy_setup_target=np.asarray(has_buy_setup_targets, dtype=bool),
+        has_sell_setup_target=np.asarray(has_sell_setup_targets, dtype=bool),
+        buy_setup_quality_score=np.asarray(buy_setup_quality_scores, dtype=np.float32),
+        sell_setup_quality_score=np.asarray(sell_setup_quality_scores, dtype=np.float32),
     )
 
 
@@ -161,4 +213,12 @@ class DirectionDataset(Dataset):
             item['has_edge_targets'] = torch.tensor(has_edge, dtype=torch.bool)
         if self.arr.analytic_signal_class is not None:
             item['analytic_signal_class'] = torch.tensor(int(self.arr.analytic_signal_class[idx]), dtype=torch.long)
+        if self.arr.buy_setup_target is not None and self.arr.sell_setup_target is not None:
+            item['buy_setup_target'] = torch.tensor(int(self.arr.buy_setup_target[idx]), dtype=torch.long)
+            item['sell_setup_target'] = torch.tensor(int(self.arr.sell_setup_target[idx]), dtype=torch.long)
+            item['has_buy_setup_target'] = torch.tensor(bool(self.arr.has_buy_setup_target[idx]), dtype=torch.bool)
+            item['has_sell_setup_target'] = torch.tensor(bool(self.arr.has_sell_setup_target[idx]), dtype=torch.bool)
+        if self.arr.buy_setup_quality_score is not None and self.arr.sell_setup_quality_score is not None:
+            item['buy_setup_quality_score'] = torch.tensor(float(self.arr.buy_setup_quality_score[idx]), dtype=torch.float32)
+            item['sell_setup_quality_score'] = torch.tensor(float(self.arr.sell_setup_quality_score[idx]), dtype=torch.float32)
         return item

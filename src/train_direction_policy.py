@@ -24,6 +24,11 @@ from .analytic_signals import ensure_analytic_signal_features
 from .forex import validate_forex_symbols
 from .io_utils import ensure_dir, normalise_time_column, read_processed_csv, write_json
 from .targets import generate_direction_targets
+from .replay_decision_parameters import (
+    config_snapshot,
+    resolve_replay_decision_parameters,
+    resolve_training_decision_parameters,
+)
 
 
 def _json_safe(value: Any) -> Any:
@@ -156,6 +161,69 @@ def _model_paths(symbol: str, cfg: dict[str, Any]) -> tuple[Path, Path, Path, Pa
     features_path = model_dir / f'{symbol}_{tf}_direction_features.json'
     report_path = Path((cfg.get('paths') or {}).get('log_dir', 'logs')) / f'{symbol}_{tf}_direction_training_report.json'
     return model_path, scaler_path, features_path, report_path
+
+
+def _epoch_artifact_paths(epoch_dir: Path, symbol: str, cfg: dict[str, Any], epoch: int) -> tuple[Path, Path, Path]:
+    """Return model/scaler/features paths for a saved epoch checkpoint.
+
+    Each epoch checkpoint is made self-contained by saving the scaler and
+    feature metadata next to the epoch model. The scaler/feature contents are
+    normally identical across epochs for a run, but storing them per checkpoint
+    avoids accidentally replaying or deploying an epoch checkpoint with a scaler
+    or feature list from another model, symbol, side, or later run.
+    """
+    tf = _timeframe(cfg)
+    stem = f'{symbol}_{tf}_direction_policy_epoch_{int(epoch):03d}'
+    checkpoint_path = epoch_dir / f'{stem}.pt'
+    scaler_path = epoch_dir / f'{stem}_scaler.pkl'
+    features_path = epoch_dir / f'{stem}_features.json'
+    return checkpoint_path, scaler_path, features_path
+
+
+def _feature_metadata(
+    *,
+    arr: Any,
+    architecture_name: str,
+    model: nn.Module,
+    train_side: str | None,
+    deployment_decision_parameters: dict[str, Any],
+    resolved_config_snapshot: dict[str, Any],
+    symbol: str,
+    cfg: dict[str, Any],
+    epoch: int | None = None,
+    checkpoint_path: Path | None = None,
+    scaler_path: Path | None = None,
+) -> dict[str, Any]:
+    meta = {
+        'feature_columns': list(arr.feature_columns),
+        'architecture': architecture_name,
+        'model_details': getattr(model, 'model_details', {}),
+        'symbol': symbol,
+        'timeframe': _timeframe(cfg),
+        'train_side': train_side,
+        'deployment_decision_parameters': deployment_decision_parameters,
+        'config_snapshot': {k: v for k, v in resolved_config_snapshot.items() if k != 'resolved_sections'},
+    }
+    if epoch is not None:
+        meta['epoch'] = int(epoch)
+    if checkpoint_path is not None:
+        meta['checkpoint_model_path'] = str(checkpoint_path)
+    if scaler_path is not None:
+        meta['checkpoint_scaler_path'] = str(scaler_path)
+    return meta
+
+
+def _save_scaler_and_features(
+    *,
+    scaler: Any,
+    scaler_path: Path,
+    features_path: Path,
+    feature_metadata: dict[str, Any],
+) -> None:
+    ensure_dir(scaler_path.parent)
+    ensure_dir(features_path.parent)
+    joblib.dump(scaler, scaler_path)
+    write_json(features_path, _json_safe(feature_metadata))
 
 
 def _filter_date_range(df: pd.DataFrame, date_start: str | None, date_end: str | None) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -686,6 +754,57 @@ def _cfg_bool(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
+
+
+def _normalise_training_side(value: Any) -> str:
+    """Return training side selector: both, buy, or sell."""
+    if value is None:
+        return 'both'
+    side = str(value).strip().lower()
+    aliases = {
+        '': 'both',
+        'all': 'both',
+        'both_sides': 'both',
+        'combined': 'both',
+        'long': 'buy',
+        'short': 'sell',
+    }
+    side = aliases.get(side, side)
+    if side not in {'both', 'buy', 'sell'}:
+        raise ValueError(f"Unsupported training side {value!r}; use both, buy, or sell.")
+    return side
+
+
+def _training_side(cfg: dict[str, Any]) -> str:
+    tcfg = cfg.get('training', {}) or {}
+    raw = cfg.get('_training_side', tcfg.get('side_setup_train_side', tcfg.get('train_side', 'both')))
+    return _normalise_training_side(raw)
+
+
+def _apply_training_side_to_config(cfg: dict[str, Any], side: str) -> dict[str, Any]:
+    """Apply BUY-only/SELL-only training and replay filters to a config copy.
+
+    Side-specific model files are normally separated by the local runner via
+    generated per-task configs. This helper only changes the learning/replay
+    semantics; it does not silently rewrite paths.
+    """
+    side = _normalise_training_side(side)
+    cfg = copy.deepcopy(cfg)
+    cfg['_training_side'] = side
+    tcfg = cfg.setdefault('training', {})
+    tcfg['side_setup_train_side'] = side
+    tcfg['train_side'] = side
+    if side in {'buy', 'sell'}:
+        # Train only the selected setup head. The other head is still present in
+        # the checkpoint for architecture compatibility, but its setup loss is
+        # zero and replay is side-filtered below.
+        tcfg['buy_setup_loss_weight'] = 1.0 if side == 'buy' else 0.0
+        tcfg['sell_setup_loss_weight'] = 1.0 if side == 'sell' else 0.0
+        rcfg = cfg.setdefault('replay', {})
+        rcfg['allow_buy'] = side == 'buy'
+        rcfg['allow_sell'] = side == 'sell'
+    return cfg
+
 def _branch_auxiliary_enabled(cfg: dict[str, Any]) -> bool:
     tcfg = cfg.get('training', {}) or {}
     explicit = tcfg.get('use_branch_auxiliary_loss')
@@ -806,6 +925,181 @@ def _mean_metric_rows(rows: list[dict[str, float]]) -> dict[str, float]:
             out[key] = float(np.mean(vals))
     return out
 
+
+
+
+def _side_setup_training_mode(cfg: dict[str, Any]) -> bool:
+    """Return True when the dataset/config should use side-specific setup heads.
+
+    The strong-setup labelling path can be enabled from either training.target_mode
+    or labels.method / labels.strong_setup.output_mode. This guard prevents Kaggle
+    runs from silently falling back to the old 3-class hierarchical gate when a
+    copied config is missing training.target_mode.
+    """
+    tcfg = cfg.get('training', {}) or {}
+    mcfg = cfg.get('model', {}) or {}
+    lcfg = cfg.get('labels', {}) or {}
+    mode = str(tcfg.get('target_mode', mcfg.get('target_mode', 'direction')) or 'direction').strip().lower()
+    if mode in {'side_setup', 'side_setup_ranking', 'setup_ranking', 'side_specific_setup'}:
+        return True
+    label_method = str(lcfg.get('method', lcfg.get('label_method', '')) or '').strip().lower()
+    strong_cfg = lcfg.get('strong_setup', {}) or {}
+    output_mode = str(strong_cfg.get('output_mode', '') or '').strip().lower() if isinstance(strong_cfg, dict) else ''
+    return (
+        label_method in {'strong_setup_v1', 'side_setup_v1', 'side_setup_ranking'}
+        or output_mode in {'event_based', 'side_setup', 'side_setup_ranking', 'setup_ranking'}
+    )
+
+
+def _setup_loss_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    tcfg = cfg.get('training', {}) or {}
+    mcfg = cfg.get('model', {}) or {}
+    train_side = _training_side(cfg)
+    buy_weight = float(tcfg.get('buy_setup_loss_weight', tcfg.get('setup_loss_weight', 1.0)) or 0.0)
+    sell_weight = float(tcfg.get('sell_setup_loss_weight', tcfg.get('setup_loss_weight', 1.0)) or 0.0)
+    if train_side == 'buy':
+        sell_weight = 0.0
+    elif train_side == 'sell':
+        buy_weight = 0.0
+    return {
+        'train_side': train_side,
+        'buy_setup_loss_weight': buy_weight,
+        'sell_setup_loss_weight': sell_weight,
+        'use_setup_quality_loss': _cfg_bool(tcfg.get('use_setup_quality_loss'), bool(mcfg.get('use_setup_quality_head', True))),
+        'setup_quality_loss_weight': float(tcfg.get('setup_quality_loss_weight', 0.10) or 0.0),
+        'setup_quality_scale': float(mcfg.get('setup_quality_scale', mcfg.get('edge_pips_scale', 12.0)) or 12.0),
+        'buy_setup_pos_weight': tcfg.get('_buy_setup_pos_weight', tcfg.get('buy_setup_pos_weight', tcfg.get('setup_pos_weight', 'auto'))),
+        'sell_setup_pos_weight': tcfg.get('_sell_setup_pos_weight', tcfg.get('sell_setup_pos_weight', tcfg.get('setup_pos_weight', 'auto'))),
+    }
+
+
+def _auto_setup_pos_weight(targets: np.ndarray | None, mask: np.ndarray | None, cfg: dict[str, Any], side: str) -> float:
+    tcfg = cfg.get('training', {}) or {}
+    explicit = tcfg.get(f'{side}_setup_pos_weight', tcfg.get('setup_pos_weight', 'auto'))
+    if explicit not in (None, '', 'auto', 'balanced', 'inverse_frequency'):
+        try:
+            return max(float(explicit), 0.0)
+        except Exception:
+            pass
+    if targets is None or mask is None:
+        return 1.0
+    target = np.asarray(targets, dtype=int)
+    valid = np.asarray(mask, dtype=bool)
+    pos = max(float(((target == 1) & valid).sum()), 1.0)
+    neg = max(float(((target == 0) & valid).sum()), 1.0)
+    value = neg / pos
+    min_w = float(tcfg.get('min_setup_pos_weight', 0.25) or 0.25)
+    max_w = float(tcfg.get('max_setup_pos_weight', 10.0) or 10.0)
+    return float(np.clip(value, min_w, max_w))
+
+
+def _side_setup_loss_components(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    cfg: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    settings = _setup_loss_settings(cfg)
+    def _safe_float_setting(value: Any, default: float = 1.0) -> float:
+        try:
+            return float(value if value not in (None, '') else default)
+        except Exception:
+            return float(default)
+    device = outputs['buy_setup_logit'].device
+    zero = outputs['buy_setup_logit'].sum() * 0.0
+
+    def _one_side(side: str) -> tuple[torch.Tensor, int, float, float, float]:
+        logit = outputs[f'{side}_setup_logit'].view(-1)
+        target = batch[f'{side}_setup_target'].to(device=device).float().view(-1)
+        mask = batch.get(f'has_{side}_setup_target')
+        if mask is None:
+            mask = torch.ones_like(target, dtype=torch.bool)
+        else:
+            mask = mask.to(device=device).bool().view(-1)
+        if not bool(mask.any()):
+            return zero, 0, 0.0, 0.0, 0.0
+        raw_pos_weight = settings.get(f'{side}_setup_pos_weight', 1.0)
+        try:
+            pos_weight_value = float(raw_pos_weight if raw_pos_weight not in (None, '') else 1.0)
+        except Exception:
+            pos_weight_value = 1.0
+        pos_weight = torch.tensor([max(pos_weight_value, 0.0)], dtype=torch.float32, device=device)
+        loss_vec = F.binary_cross_entropy_with_logits(logit[mask], target[mask], pos_weight=pos_weight, reduction='none')
+        loss = loss_vec.mean()
+        prob = torch.sigmoid(logit[mask])
+        pred = prob >= 0.5
+        truth = target[mask] >= 0.5
+        tp = int((pred & truth).sum().detach().cpu().item())
+        fp = int((pred & ~truth).sum().detach().cpu().item())
+        fn = int((~pred & truth).sum().detach().cpu().item())
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+        return loss, int(mask.sum().detach().cpu().item()), float(precision), float(recall), float(f1)
+
+    buy_loss, buy_count, buy_precision, buy_recall, buy_f1 = _one_side('buy')
+    sell_loss, sell_count, sell_precision, sell_recall, sell_f1 = _one_side('sell')
+
+    quality_loss = zero
+    quality_count = 0
+    if (
+        bool(settings.get('use_setup_quality_loss'))
+        and float(settings.get('setup_quality_loss_weight', 0.0) or 0.0) > 0.0
+        and 'setup_quality' in outputs
+        and 'buy_setup_quality_score' in batch
+        and 'sell_setup_quality_score' in batch
+    ):
+        qmask_buy = batch.get('has_buy_setup_target')
+        qmask_sell = batch.get('has_sell_setup_target')
+        if qmask_buy is None:
+            qmask_buy = torch.ones_like(batch['buy_setup_quality_score'], dtype=torch.bool)
+        else:
+            qmask_buy = qmask_buy.to(device=device).bool()
+        if qmask_sell is None:
+            qmask_sell = torch.ones_like(batch['sell_setup_quality_score'], dtype=torch.bool)
+        else:
+            qmask_sell = qmask_sell.to(device=device).bool()
+        target_q = torch.stack([
+            batch['buy_setup_quality_score'].to(device=device, dtype=torch.float32),
+            batch['sell_setup_quality_score'].to(device=device, dtype=torch.float32),
+        ], dim=1)
+        pred_q = outputs['setup_quality']
+        mask_q = torch.stack([qmask_buy, qmask_sell], dim=1).bool()
+        train_side = str(settings.get('train_side', 'both') or 'both').lower()
+        if train_side == 'buy':
+            mask_q[:, 1] = False
+        elif train_side == 'sell':
+            mask_q[:, 0] = False
+        if bool(mask_q.any()):
+            scale = max(float(settings.get('setup_quality_scale', 12.0) or 12.0), 1e-6)
+            quality_loss = F.smooth_l1_loss(pred_q[mask_q] / scale, target_q[mask_q] / scale)
+            quality_count = int(mask_q.sum().detach().cpu().item())
+
+    total = (
+        float(settings.get('buy_setup_loss_weight', 1.0)) * buy_loss
+        + float(settings.get('sell_setup_loss_weight', 1.0)) * sell_loss
+        + float(settings.get('setup_quality_loss_weight', 0.0)) * quality_loss
+    )
+    return total, {
+        'loss': float(total.detach().cpu().item()),
+        'setup_loss': float(total.detach().cpu().item()),
+        'buy_setup_loss': float(buy_loss.detach().cpu().item()),
+        'sell_setup_loss': float(sell_loss.detach().cpu().item()),
+        'buy_setup_target_count': float(buy_count),
+        'sell_setup_target_count': float(sell_count),
+        'buy_setup_precision_05': float(buy_precision),
+        'buy_setup_recall_05': float(buy_recall),
+        'buy_setup_f1_05': float(buy_f1),
+        'sell_setup_precision_05': float(sell_precision),
+        'sell_setup_recall_05': float(sell_recall),
+        'sell_setup_f1_05': float(sell_f1),
+        'setup_quality_loss': float(quality_loss.detach().cpu().item()),
+        'setup_quality_target_count': float(quality_count),
+        'buy_setup_loss_weight': float(settings.get('buy_setup_loss_weight', 1.0)),
+        'sell_setup_loss_weight': float(settings.get('sell_setup_loss_weight', 1.0)),
+        'setup_quality_loss_weight': float(settings.get('setup_quality_loss_weight', 0.0)),
+        'buy_setup_pos_weight': _safe_float_setting(settings.get('buy_setup_pos_weight', 1.0), 1.0),
+        'sell_setup_pos_weight': _safe_float_setting(settings.get('sell_setup_pos_weight', 1.0), 1.0),
+    }
 
 
 def _hierarchical_loss_settings(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -994,13 +1288,26 @@ def _eval_model(
     ce = nn.CrossEntropyLoss()
     aux_enabled = branch_auxiliary_bce is not None and branch_auxiliary_weight > 0.0
     hierarchical = bool(getattr(model, 'is_hierarchical', False))
+    setup_training_mode = bool(cfg is not None and _side_setup_training_mode(cfg))
     model.eval()
     with torch.no_grad():
         for batch in loader:
             x = batch['x'].to(device)
             y = batch['direction'].to(device)
             outputs = model(x)
-            if hierarchical:
+            if setup_training_mode:
+                if cfg is None:
+                    raise RuntimeError('Side-setup evaluation requires cfg.')
+                total_loss, smetrics = _side_setup_loss_components(
+                    outputs,
+                    {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()},
+                    cfg,
+                )
+                direction_loss = torch.tensor(float(smetrics.get('setup_loss', 0.0)), device=device)
+                probs = direction_probabilities_from_outputs(outputs)
+                hier_rows.append(smetrics)
+                edge_rows.append(_edge_metrics_from_outputs(outputs, {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}))
+            elif hierarchical:
                 if gate_bce is None or side_ce is None or cfg is None:
                     raise RuntimeError('Hierarchical evaluation requires gate_bce, side_ce and cfg.')
                 total_loss, hmetrics = _hierarchical_loss_components(outputs, {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}, cfg, gate_bce, side_ce)
@@ -1034,7 +1341,7 @@ def _eval_model(
     m = _metrics(y_true, y_pred, probs)
     m['loss'] = float(np.mean(losses)) if losses else 0.0
     m['direction_loss'] = float(np.mean(direction_losses)) if direction_losses else 0.0
-    if hierarchical:
+    if setup_training_mode or hierarchical:
         m.update(_mean_metric_rows(hier_rows))
         m.update(_mean_metric_rows(edge_rows))
         # Extra gate-oriented metrics: these directly measure the decision to trade.
@@ -1086,6 +1393,12 @@ def _select_epoch_score(val_metrics: dict[str, Any], replay_summary: dict[str, A
 
 
 def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    cli_train_side = getattr(args, 'train_side', None)
+    if cli_train_side is not None:
+        cfg = _apply_training_side_to_config(cfg, cli_train_side)
+    else:
+        cfg = _apply_training_side_to_config(cfg, _training_side(cfg))
+    train_side = _training_side(cfg)
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     tcfg = cfg.get('training', {}) or {}
     seed_info = _seed_settings(symbol, cfg, args)
@@ -1151,6 +1464,25 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
     val_subset = Subset(dataset, val_idx.tolist())
     curriculum_settings = _curriculum_sampler_settings(cfg)
     curriculum_report = _curriculum_static_report(arr.y_direction[train_idx], curriculum_settings)
+    setup_training_mode = _side_setup_training_mode(cfg)
+    if setup_training_mode:
+        # Store fixed, training-set-only positive weights in the copied config so
+        # per-batch losses do not leak validation distribution information.
+        cfg.setdefault('training', {})['_buy_setup_pos_weight'] = _auto_setup_pos_weight(
+            None if arr.buy_setup_target is None else np.asarray(arr.buy_setup_target)[train_idx],
+            None if arr.has_buy_setup_target is None else np.asarray(arr.has_buy_setup_target)[train_idx],
+            cfg,
+            'buy',
+        )
+        cfg.setdefault('training', {})['_sell_setup_pos_weight'] = _auto_setup_pos_weight(
+            None if arr.sell_setup_target is None else np.asarray(arr.sell_setup_target)[train_idx],
+            None if arr.has_sell_setup_target is None else np.asarray(arr.has_sell_setup_target)[train_idx],
+            cfg,
+            'sell',
+        )
+        cfg.setdefault('model', {})['use_side_setup_heads'] = True
+        cfg.setdefault('model', {})['decision_output_mode'] = cfg.get('model', {}).get('decision_output_mode', 'side_setup')
+        cfg.setdefault('model', {})['use_setup_quality_head'] = cfg.get('model', {}).get('use_setup_quality_head', True)
 
     def make_train_loader(epoch_seed: int | None = None, epoch: int | None = None) -> tuple[DataLoader, dict[str, Any] | None]:
         if curriculum_settings.get('enabled'):
@@ -1185,7 +1517,7 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
     model = DirectionTradePolicyNet(arr.X_seq.shape[-1], cfg).to(device)
     architecture_name = str(getattr(model, 'architecture', (cfg.get('model') or {}).get('architecture', 'hierarchical_tcn_edge_v1')))
     hierarchical_model = bool(getattr(model, 'is_hierarchical', False))
-    weights = _class_weights(arr.y_direction[train_idx], cfg) if not hierarchical_model else None
+    weights = _class_weights(arr.y_direction[train_idx], cfg) if (not hierarchical_model and not setup_training_mode) else None
     ce = nn.CrossEntropyLoss(weight=weights.to(device) if weights is not None else None)
 
     gate_pos_weight = _gate_pos_weight_tensor(arr.y_direction[train_idx], cfg, device) if hierarchical_model else None
@@ -1194,7 +1526,7 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
     side_ce = nn.CrossEntropyLoss(weight=side_weights) if hierarchical_model else None
     hierarchical_loss_config = _hierarchical_loss_settings(cfg) if hierarchical_model else None
 
-    branch_auxiliary_enabled = (not hierarchical_model) and _branch_auxiliary_enabled(cfg)
+    branch_auxiliary_enabled = (not hierarchical_model) and (not setup_training_mode) and _branch_auxiliary_enabled(cfg)
     branch_auxiliary_weight = _branch_auxiliary_loss_weight(cfg) if branch_auxiliary_enabled else 0.0
     branch_auxiliary_pos_weights = _branch_auxiliary_pos_weights(arr.y_direction[train_idx], cfg) if branch_auxiliary_enabled else None
     branch_auxiliary_branch_weights = _branch_auxiliary_branch_weights(cfg) if branch_auxiliary_enabled else None
@@ -1222,21 +1554,51 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
     min_delta = float(tcfg.get('min_delta', 1e-4))
 
     model_type_name = str((getattr(model, 'model_details', {}) or {}).get('model_type', architecture_name))
+    replay_start_for_report, replay_end_for_report = _replay_eval_window(cfg)
+    deployment_decision_parameters = resolve_replay_decision_parameters(
+        cfg,
+        train_side=train_side,
+        eval_start=replay_start_for_report,
+        eval_end=replay_end_for_report,
+        symbol=symbol,
+    )
+    training_decision_parameters = resolve_training_decision_parameters(cfg, train_side=train_side, symbol=symbol)
+    resolved_config_snapshot = config_snapshot(
+        cfg,
+        config_path=getattr(args, 'config', None) or cfg.get('_config_path'),
+        base_config_path=cfg.get('_base_config_path'),
+        include_resolved_sections=True,
+    )
 
     model_path, scaler_path, features_path, report_path = _model_paths(symbol, cfg)
     ensure_dir(model_path.parent)
     ensure_dir(report_path.parent)
-    # Save scaler/features before the epoch loop so optional per-epoch replay can
-    # load every checkpoint exactly as replay/live will use it.
-    joblib.dump(arr.scaler, scaler_path)
-    write_json(features_path, {'feature_columns': arr.feature_columns, 'architecture': architecture_name, 'model_details': getattr(model, 'model_details', {})})
+    # Save the run-level scaler/features before the epoch loop so optional
+    # per-epoch replay can load the final/best checkpoint exactly as live will
+    # use it. Per-epoch copies are also saved below beside every checkpoint.
+    run_feature_metadata = _feature_metadata(
+        arr=arr,
+        architecture_name=architecture_name,
+        model=model,
+        train_side=train_side,
+        deployment_decision_parameters=deployment_decision_parameters,
+        resolved_config_snapshot=resolved_config_snapshot,
+        symbol=symbol,
+        cfg=cfg,
+    )
+    _save_scaler_and_features(
+        scaler=arr.scaler,
+        scaler_path=scaler_path,
+        features_path=features_path,
+        feature_metadata=run_feature_metadata,
+    )
     epoch_dir = model_path.parent / str(tcfg.get('epoch_model_dir', 'epoch_checkpoints')) / symbol
     save_epoch_models = bool(tcfg.get('save_epoch_models', True))
     if save_epoch_models:
         ensure_dir(epoch_dir)
 
     history: list[dict[str, Any]] = []
-    best_score = -1e9
+    best_score = float('-inf')
     best_epoch = 0
     best_payload: dict[str, Any] | None = None
     bad_epochs = 0
@@ -1262,7 +1624,15 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
             y = batch['direction'].to(device)
             opt.zero_grad(set_to_none=True)
             outputs = model(x)
-            if hierarchical_model:
+            if setup_training_mode:
+                loss, smetrics = _side_setup_loss_components(
+                    outputs,
+                    {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()},
+                    cfg,
+                )
+                direction_loss = torch.tensor(float(smetrics.get('setup_loss', 0.0)), device=device)
+                aux_metric_rows.append(smetrics)
+            elif hierarchical_model:
                 if gate_bce is None or side_ce is None:
                     raise RuntimeError('Hierarchical model missing gate/side losses')
                 loss, hmetrics = _hierarchical_loss_components(
@@ -1308,7 +1678,7 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
             'loss': float(np.mean(losses)) if losses else 0.0,
             'direction_loss': float(np.mean(direction_losses)) if direction_losses else 0.0,
         }
-        if hierarchical_model:
+        if setup_training_mode or hierarchical_model:
             train_metrics.update(_mean_metric_rows(aux_metric_rows))
         elif branch_auxiliary_bce is not None:
             train_metrics['total_loss_with_branch_auxiliary'] = train_metrics['loss']
@@ -1319,7 +1689,14 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
             train_metrics['curriculum_trade_samples'] = int(curriculum_plan.get('trade_samples', 0) or 0)
             train_metrics['curriculum_no_trade_samples'] = int(curriculum_plan.get('no_trade_samples', 0) or 0)
             train_metrics['curriculum_no_trade_to_trade_sample_ratio'] = curriculum_plan.get('no_trade_to_trade_sample_ratio')
-        row = {'epoch': epoch, 'train': train_metrics, 'validation': val_metrics}
+        row = {
+            'epoch': epoch,
+            'train': train_metrics,
+            'validation': val_metrics,
+            'train_side': train_side,
+            'training_decision_parameters': training_decision_parameters,
+            'deployment_decision_parameters': deployment_decision_parameters,
+        }
         if curriculum_plan is not None:
             row['curriculum'] = curriculum_plan
         if seed_info.get('enabled'):
@@ -1337,13 +1714,43 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
             'curriculum_sampler_config': curriculum_report,
             'branch_auxiliary_config': branch_auxiliary_config,
             'hierarchical_loss_config': hierarchical_loss_config,
+            'setup_loss_config': _setup_loss_settings(cfg) if setup_training_mode else None,
             'model_details': getattr(model, 'model_details', {}),
             'seed_config': seed_info,
             'validation_metrics': val_metrics,
+            'train_side': train_side,
+            'deployment_decision_parameters': deployment_decision_parameters,
+            'training_decision_parameters': training_decision_parameters,
+            'config_snapshot': {k: v for k, v in resolved_config_snapshot.items() if k != 'resolved_sections'},
         }
-        epoch_checkpoint_path = epoch_dir / f'{symbol}_{_timeframe(cfg)}_direction_policy_epoch_{epoch:03d}.pt'
+        epoch_checkpoint_path, epoch_scaler_path, epoch_features_path = _epoch_artifact_paths(epoch_dir, symbol, cfg, epoch)
+        epoch_feature_metadata = _feature_metadata(
+            arr=arr,
+            architecture_name=architecture_name,
+            model=model,
+            train_side=train_side,
+            deployment_decision_parameters=deployment_decision_parameters,
+            resolved_config_snapshot=resolved_config_snapshot,
+            symbol=symbol,
+            cfg=cfg,
+            epoch=epoch,
+            checkpoint_path=epoch_checkpoint_path,
+            scaler_path=epoch_scaler_path,
+        )
+        row['checkpoint_artifacts'] = {
+            'model_path': str(epoch_checkpoint_path),
+            'scaler_path': str(epoch_scaler_path),
+            'features_path': str(epoch_features_path),
+        }
+        payload['checkpoint_artifacts'] = row['checkpoint_artifacts']
         if save_epoch_models:
             torch.save(payload, epoch_checkpoint_path)
+            _save_scaler_and_features(
+                scaler=arr.scaler,
+                scaler_path=epoch_scaler_path,
+                features_path=epoch_features_path,
+                feature_metadata=epoch_feature_metadata,
+            )
 
         replay_summary = None
         if _replay_enabled(cfg) and save_epoch_models:
@@ -1356,8 +1763,8 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
                     symbol,
                     cfg,
                     model_path=epoch_checkpoint_path,
-                    scaler_path=scaler_path,
-                    features_path=features_path,
+                    scaler_path=epoch_scaler_path,
+                    features_path=epoch_features_path,
                     eval_start=replay_start,
                     eval_end=replay_end,
                     output_prefix=str(replay_prefix),
@@ -1371,8 +1778,20 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
                     'buy_average_net_pips', 'buy_loss_pips', 'buy_losing_trades',
                     'sell_trades', 'sell_net_pips', 'sell_win_rate',
                     'sell_average_net_pips', 'sell_loss_pips', 'sell_losing_trades',
-                    'replay_score', 'summary_path', 'decisions_path', 'trades_path'
+                    'replay_score', 'summary_path', 'decisions_path', 'trades_path',
+                    'threshold_mode', 'rolling_thresholds_used', 'allow_buy', 'allow_sell',
+                    'min_direction_probability', 'min_trade_probability', 'min_edge_pips',
+                    'decision_parameters', 'deployment_decision_parameters', 'config_snapshot',
                 )}
+                # Make the resolved settings explicit even when an older replay helper
+                # returned only a partial summary. This is what the live registry
+                # should copy for each symbol/model/side checkpoint.
+                row['replay']['decision_parameters'] = replay_summary.get('decision_parameters') or deployment_decision_parameters
+                row['replay']['deployment_decision_parameters'] = replay_summary.get('deployment_decision_parameters') or deployment_decision_parameters
+                payload['replay_summary'] = row['replay']
+                payload['model_selection_replay_score'] = replay_summary.get('replay_score')
+                if save_epoch_models:
+                    torch.save(payload, epoch_checkpoint_path)
             except Exception as exc:
                 row['replay_error'] = str(exc)
                 print(f'{symbol} epoch {epoch:03d}: replay failed: {exc}', flush=True)
@@ -1395,7 +1814,18 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
                 f" replay_sell_loss={float(replay_summary.get('sell_loss_pips', 0.0) or 0.0):.1f}"
             )
         aux_text = ''
-        if hierarchical_model:
+        if setup_training_mode:
+            aux_text = (
+                f' train_buy_setup={train_metrics.get("buy_setup_loss", 0.0):.5f}'
+                f' train_sell_setup={train_metrics.get("sell_setup_loss", 0.0):.5f}'
+                f' train_quality={train_metrics.get("setup_quality_loss", 0.0):.5f}'
+                f' val_buy_setup={val_metrics.get("buy_setup_loss", 0.0):.5f}'
+                f' val_sell_setup={val_metrics.get("sell_setup_loss", 0.0):.5f}'
+                f' val_quality={val_metrics.get("setup_quality_loss", 0.0):.5f}'
+                f' val_buy_f1={val_metrics.get("buy_setup_f1_05", 0.0):.4f}'
+                f' val_sell_f1={val_metrics.get("sell_setup_f1_05", 0.0):.4f}'
+            )
+        elif hierarchical_model:
             aux_text = (
                 f' train_gate={train_metrics.get("gate_loss", 0.0):.5f}'
                 f' train_side={train_metrics.get("side_direction_loss", 0.0):.5f}'
@@ -1428,7 +1858,7 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
             flush=True,
         )
 
-        if score > best_score + min_delta:
+        if best_payload is None or score > best_score + min_delta:
             best_score = score
             best_epoch = epoch
             # state_dict tensors are references to the live model parameters, so
@@ -1443,13 +1873,21 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
             break
 
     if best_payload is None:
-        raise RuntimeError(f'{symbol}: training did not produce a best checkpoint')
+        # Defensive fallback: this should now be rare because epoch 1 is always
+        # accepted, but keep the trainer from killing a multi-model Kaggle run.
+        if history:
+            print(f'{symbol}: WARNING no best checkpoint was selected; using last epoch payload as fallback.', flush=True)
+            best_epoch = int(history[-1].get('epoch', len(history)) or len(history))
+            best_score = float(history[-1].get('model_selection_score', -1_000_000_000.0) or -1_000_000_000.0)
+            best_payload = payload
+        else:
+            raise RuntimeError(f'{symbol}: training produced no epochs and no checkpoint')
     torch.save(best_payload, model_path)
     final_val = history[best_epoch - 1]['validation'] if 0 < best_epoch <= len(history) else history[-1]['validation']
     report = {
         'symbol': symbol,
         'timeframe': _timeframe(cfg),
-        'model_type': model_type_name if hierarchical_model else 'direction_buy_sell_no_trade',
+        'model_type': (f'{model_type_name}_side_setup_ranking' if setup_training_mode else (model_type_name if hierarchical_model else 'direction_buy_sell_no_trade')),
         'class_mapping': DIRECTION_CLASS_NAMES,
         'data': load_info,
         'sequence_rows': int(n),
@@ -1460,6 +1898,10 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
         'train_rows': int(len(train_idx)),
         'validation_rows': int(len(val_idx)),
         'seed': seed_info,
+        'train_side': train_side,
+        'training_decision_parameters': training_decision_parameters,
+        'deployment_decision_parameters': deployment_decision_parameters,
+        'config_snapshot': resolved_config_snapshot,
         'split': {
             'val_fraction': float(val_fraction),
             'val_start_sequence_index': int(val_start),
@@ -1479,6 +1921,19 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
         'validation_class_counts': _class_counts(arr.y_direction[val_idx]),
         'class_weights': None if weights is None else [float(x) for x in weights.cpu().numpy()],
         'hierarchical_loss': hierarchical_loss_config,
+        'setup_loss': _setup_loss_settings(cfg) if setup_training_mode else None,
+        'setup_target_counts_train': {
+            'buy_positive': int(((np.asarray(arr.buy_setup_target) == 1) & np.asarray(arr.has_buy_setup_target) & np.isin(np.arange(len(arr.y_direction)), train_idx)).sum()) if arr.buy_setup_target is not None else 0,
+            'buy_negative': int(((np.asarray(arr.buy_setup_target) == 0) & np.asarray(arr.has_buy_setup_target) & np.isin(np.arange(len(arr.y_direction)), train_idx)).sum()) if arr.buy_setup_target is not None else 0,
+            'sell_positive': int(((np.asarray(arr.sell_setup_target) == 1) & np.asarray(arr.has_sell_setup_target) & np.isin(np.arange(len(arr.y_direction)), train_idx)).sum()) if arr.sell_setup_target is not None else 0,
+            'sell_negative': int(((np.asarray(arr.sell_setup_target) == 0) & np.asarray(arr.has_sell_setup_target) & np.isin(np.arange(len(arr.y_direction)), train_idx)).sum()) if arr.sell_setup_target is not None else 0,
+        } if setup_training_mode else None,
+        'setup_target_counts_validation': {
+            'buy_positive': int(((np.asarray(arr.buy_setup_target) == 1) & np.asarray(arr.has_buy_setup_target) & np.isin(np.arange(len(arr.y_direction)), val_idx)).sum()) if arr.buy_setup_target is not None else 0,
+            'buy_negative': int(((np.asarray(arr.buy_setup_target) == 0) & np.asarray(arr.has_buy_setup_target) & np.isin(np.arange(len(arr.y_direction)), val_idx)).sum()) if arr.buy_setup_target is not None else 0,
+            'sell_positive': int(((np.asarray(arr.sell_setup_target) == 1) & np.asarray(arr.has_sell_setup_target) & np.isin(np.arange(len(arr.y_direction)), val_idx)).sum()) if arr.sell_setup_target is not None else 0,
+            'sell_negative': int(((np.asarray(arr.sell_setup_target) == 0) & np.asarray(arr.has_sell_setup_target) & np.isin(np.arange(len(arr.y_direction)), val_idx)).sum()) if arr.sell_setup_target is not None else 0,
+        } if setup_training_mode else None,
         'gate_pos_weight': None if gate_pos_weight is None else float(gate_pos_weight.detach().cpu().view(-1)[0].item()),
         'side_direction_class_weights': None if side_weights is None else [float(x) for x in side_weights.detach().cpu().numpy()],
         'edge_targets_available': bool(arr.has_edge_targets is not None and np.asarray(arr.has_edge_targets).any()),
@@ -1491,13 +1946,24 @@ def train_symbol(symbol: str, cfg: dict[str, Any], args: argparse.Namespace) -> 
         'branch_auxiliary': branch_auxiliary_config,
         'best_epoch': int(best_epoch),
         'best_model_selection_score': float(best_score),
+        'best_checkpoint_is_fallback': bool(best_score <= -999_999_999.0),
+        'best_checkpoint_warning': (
+            'No replay-qualified epoch was found; saved the least-bad/first available checkpoint so the multi-model pipeline can continue.'
+            if best_score <= -999_999_999.0 else None
+        ),
         'best_validation_metrics': final_val,
+        'best_replay': (history[best_epoch - 1].get('replay') if 0 < best_epoch <= len(history) else None),
         'artifacts': {
             'model_path': str(model_path),
             'scaler_path': str(scaler_path),
             'features_path': str(features_path),
             'report_path': str(report_path),
             'epoch_dir': str(epoch_dir) if save_epoch_models else None,
+            'epoch_artifact_naming': (
+                f'{symbol}_{_timeframe(cfg)}_direction_policy_epoch_###.pt / '
+                f'{symbol}_{_timeframe(cfg)}_direction_policy_epoch_###_scaler.pkl / '
+                f'{symbol}_{_timeframe(cfg)}_direction_policy_epoch_###_features.json'
+            ) if save_epoch_models else None,
         },
         'history': history,
     }
@@ -1522,9 +1988,12 @@ def main() -> None:
     p.add_argument('--deterministic', action=argparse.BooleanOptionalAction, default=None, help='Enable/disable best-effort deterministic Torch behaviour.')
     p.add_argument('--reseed-each-epoch', action=argparse.BooleanOptionalAction, default=None, help='Enable/disable deterministic per-epoch reseeding.')
     p.add_argument('--epoch-seed-mode', default=None, help='base_only, base_plus_epoch, base_plus_symbol, or base_plus_symbol_plus_epoch.')
+    p.add_argument('--train-side', choices=['both', 'buy', 'sell'], default=None, help='Train both side-setup heads, or train a BUY-only/SELL-only setup model. Replay is side-filtered automatically for buy/sell.')
     args = p.parse_args()
 
     cfg = load_config_with_optional_spread_risk(args.config)
+    cfg['_config_path'] = str(args.config)
+    cfg.setdefault('_base_config_path', str(args.config))
     symbols = validate_forex_symbols(args.symbols or ((cfg.get('trading') or {}).get('symbols') or ['EURUSD']))
     reports = []
     for symbol in symbols:

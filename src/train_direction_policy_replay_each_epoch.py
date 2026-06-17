@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument('--deterministic', action=argparse.BooleanOptionalAction, default=None, help='Enable/disable best-effort deterministic Torch behaviour.')
     parser.add_argument('--reseed-each-epoch', action=argparse.BooleanOptionalAction, default=None, help='Enable/disable deterministic per-epoch reseeding.')
     parser.add_argument('--epoch-seed-mode', default=None, help='base_only, base_plus_epoch, base_plus_symbol, or base_plus_symbol_plus_epoch.')
+    parser.add_argument('--train-side', choices=['both', 'buy', 'sell'], default=None, help='Train both side-setup heads, or train a BUY-only/SELL-only setup model. Replay is side-filtered automatically for buy/sell.')
     parser.add_argument('--replay-start', default=None)
     parser.add_argument('--replay-end', default=None)
     parser.add_argument('--replay-output-dir', default=None)
@@ -37,6 +38,8 @@ def main() -> None:
 
     cfg = load_config_with_optional_spread_risk(args.config)
     cfg = copy.deepcopy(cfg)
+    cfg['_config_path'] = str(args.config)
+    cfg.setdefault('_base_config_path', str(args.config))
     training = cfg.setdefault('training', {})
     training['replay_each_epoch'] = True
     training['save_epoch_models'] = True
@@ -57,6 +60,9 @@ def main() -> None:
         training['replay_end'] = args.replay_end
     if args.replay_output_dir is not None:
         training['replay_output_dir'] = args.replay_output_dir
+    if args.train_side is not None:
+        training['side_setup_train_side'] = args.train_side
+        training['train_side'] = args.train_side
 
     symbols = validate_forex_symbols(args.symbols or ((cfg.get('trading') or {}).get('symbols') or ['EURUSD']))
     reports = []

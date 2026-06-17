@@ -464,6 +464,10 @@ def _force_high_spread_rows_to_no_trade(
         # rows that were already supervised labels.
         direction_numeric = pd.to_numeric(out['direction_target'], errors='coerce').fillna(-1)
         out.loc[high_spread & (direction_numeric >= 0), 'direction_target'] = 1
+    for col in ('buy_setup_target', 'sell_setup_target'):
+        if col in out.columns:
+            side_numeric = pd.to_numeric(out[col], errors='coerce').fillna(-1)
+            out.loc[high_spread & (side_numeric >= 0), col] = 0
     if 'outcome_target' in out.columns:
         out.loc[high_spread, 'outcome_target'] = 1
 
@@ -530,7 +534,13 @@ def _strip_unused_target_columns(labelled: pd.DataFrame) -> pd.DataFrame:
         'side_target', 'trade_side_target', 'candidate_strength_score',
         'label_filter_status',
     }
-    keep_target_cols = {'direction_target', 'buy_edge_pips_target', 'sell_edge_pips_target'}
+    keep_target_cols = {
+        'direction_target',
+        'buy_edge_pips_target', 'sell_edge_pips_target',
+        'buy_setup_target', 'sell_setup_target',
+        'buy_setup_quality_score_target', 'sell_setup_quality_score_target',
+        'buy_setup_analytic_score', 'sell_setup_analytic_score',
+    }
     drop_cols = [
         c for c in labelled.columns
         if (
